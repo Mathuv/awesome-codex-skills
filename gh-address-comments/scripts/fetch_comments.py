@@ -11,13 +11,17 @@ Requires:
 
 Usage:
   python fetch_comments.py > pr_comments.json
+  python fetch_comments.py --format markdown
+  python fetch_comments.py --format markdown --unresolved-only
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
+import textwrap
 from typing import Any
 
 QUERY = """\
@@ -42,6 +46,7 @@ query(
         nodes {
           id
           body
+          url
           createdAt
           updatedAt
           author { login }
@@ -55,6 +60,7 @@ query(
           id
           state
           body
+          url
           submittedAt
           author { login }
         }
@@ -79,6 +85,7 @@ query(
             nodes {
               id
               body
+              url
               createdAt
               updatedAt
               author { login }
@@ -226,11 +233,146 @@ def fetch_all(owner: str, repo: str, number: int) -> dict[str, Any]:
     }
 
 
+def _sort_thread_key(thread: dict[str, Any]) -> tuple[str, int, str]:
+    comments = thread.get("comments", {}).get("nodes") or []
+    created_at = comments[0].get("createdAt", "") if comments else ""
+    line = thread.get("line") or thread.get("originalLine") or thread.get("startLine") or 0
+    path = thread.get("path") or ""
+    return path, int(line), created_at
+
+
+def _body_text(text: str | None) -> str:
+    stripped = (text or "").strip()
+    return stripped if stripped else "(no body)"
+
+
+def _indent_block(text: str, prefix: str) -> str:
+    return textwrap.indent(text, prefix)
+
+
+def _thread_location(thread: dict[str, Any]) -> str:
+    path = thread.get("path") or "(no path)"
+    line = thread.get("line") or thread.get("originalLine") or thread.get("startLine")
+    return f"{path}:{line}" if line else path
+
+
+def _thread_status(thread: dict[str, Any]) -> str:
+    labels: list[str] = []
+    labels.append("resolved" if thread.get("isResolved") else "unresolved")
+    if thread.get("isOutdated"):
+        labels.append("outdated")
+    return ", ".join(labels)
+
+
+def _format_review_thread(thread: dict[str, Any], number: int) -> str:
+    comments = thread.get("comments", {}).get("nodes") or []
+    lines = [f"{number}. [{_thread_status(thread)}] `{_thread_location(thread)}`"]
+    if comments and comments[0].get("url"):
+        lines.append(f"   URL: {comments[0]['url']}")
+    lines.append("   Thread:")
+    for comment in comments:
+        author = (comment.get("author") or {}).get("login") or "unknown"
+        created_at = comment.get("createdAt") or "unknown time"
+        lines.append(f"   - {author} @ {created_at}")
+        lines.append(_indent_block(_body_text(comment.get("body")), "     "))
+    return "\n".join(lines)
+
+
+def _format_conversation_comment(comment: dict[str, Any], number: int) -> str:
+    author = (comment.get("author") or {}).get("login") or "unknown"
+    created_at = comment.get("createdAt") or "unknown time"
+    lines = [f"{number}. [conversation] {author} @ {created_at}"]
+    if comment.get("url"):
+        lines.append(f"   URL: {comment['url']}")
+    lines.append("   Body:")
+    lines.append(_indent_block(_body_text(comment.get("body")), "     "))
+    return "\n".join(lines)
+
+
+def _format_review(review: dict[str, Any], number: int) -> str:
+    author = (review.get("author") or {}).get("login") or "unknown"
+    submitted_at = review.get("submittedAt") or "unknown time"
+    state = review.get("state") or "UNKNOWN"
+    lines = [f"{number}. [review:{state.lower()}] {author} @ {submitted_at}"]
+    if review.get("url"):
+        lines.append(f"   URL: {review['url']}")
+    lines.append("   Body:")
+    lines.append(_indent_block(_body_text(review.get("body")), "     "))
+    return "\n".join(lines)
+
+
+def to_markdown(result: dict[str, Any], unresolved_only: bool = False) -> str:
+    pr = result["pull_request"]
+    threads = sorted(result.get("review_threads") or [], key=_sort_thread_key)
+    unresolved_threads = [thread for thread in threads if not thread.get("isResolved")]
+    resolved_threads = [thread for thread in threads if thread.get("isResolved")]
+    conversation_comments = result.get("conversation_comments") or []
+    reviews = [review for review in (result.get("reviews") or []) if (review.get("body") or "").strip()]
+
+    lines = [
+        f"# PR #{pr['number']} — {pr['title']}",
+        "",
+        f"- Repo: `{pr['owner']}/{pr['repo']}`",
+        f"- State: `{pr['state']}`",
+        f"- URL: {pr['url']}",
+    ]
+
+    counter = 1
+
+    if unresolved_threads:
+        lines.extend(["", f"## Unresolved review threads ({len(unresolved_threads)})", ""])
+        for thread in unresolved_threads:
+            lines.append(_format_review_thread(thread, counter))
+            lines.append("")
+            counter += 1
+
+    if not unresolved_only and conversation_comments:
+        lines.extend(["", f"## Conversation comments ({len(conversation_comments)})", ""])
+        for comment in conversation_comments:
+            lines.append(_format_conversation_comment(comment, counter))
+            lines.append("")
+            counter += 1
+
+    if not unresolved_only and reviews:
+        lines.extend(["", f"## Review summaries with body ({len(reviews)})", ""])
+        for review in reviews:
+            lines.append(_format_review(review, counter))
+            lines.append("")
+            counter += 1
+
+    if not unresolved_only and resolved_threads:
+        lines.extend(["", f"## Resolved review threads ({len(resolved_threads)})", ""])
+        for thread in resolved_threads:
+            lines.append(_format_review_thread(thread, counter))
+            lines.append("")
+            counter += 1
+
+    if counter == 1:
+        lines.extend(["", "No comments or review threads found."])
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fetch GitHub PR comments and review threads for the current branch")
+    parser.add_argument("--format", choices=["json", "markdown"], default="json")
+    parser.add_argument(
+        "--unresolved-only",
+        action="store_true",
+        help="Only include unresolved review threads in markdown output",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     _ensure_gh_authenticated()
     owner, repo, number = get_current_pr_ref()
     result = fetch_all(owner, repo, number)
-    print(json.dumps(result, indent=2))
+    if args.format == "markdown":
+        print(to_markdown(result, unresolved_only=args.unresolved_only), end="")
+    else:
+        print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
